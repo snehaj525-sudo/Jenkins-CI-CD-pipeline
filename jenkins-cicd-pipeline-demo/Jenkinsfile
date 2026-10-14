@@ -1,0 +1,98 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME      = "sample-app"
+        DOCKERHUB_REPO  = "yourdockerhubuser/sample-app"   // replace with your registry
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"
+        SONARQUBE_ENV   = "sonarqube-server"                // name configured in Jenkins > Configure System
+        HELM_RELEASE    = "sample-app"
+        HELM_NAMESPACE  = "default"
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo "Building ${IMAGE_NAME}:${IMAGE_TAG}"
+                sh 'docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .'
+            }
+        }
+
+        stage('Code Quality - SonarQube') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE_ENV}") {
+                    sh '''
+                        sonar-scanner \
+                          -Dsonar.projectKey=sample-app \
+                          -Dsonar.sources=. \
+                          -Dsonar.host.url=$SONAR_HOST_URL \
+                          -Dsonar.login=$SONAR_AUTH_TOKEN
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Push to Registry') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                        docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes via Helm') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                        helm upgrade --install ${HELM_RELEASE} ./helm/sample-app \
+                          --namespace ${HELM_NAMESPACE} \
+                          --set image.repository=${DOCKERHUB_REPO} \
+                          --set image.tag=${IMAGE_TAG} \
+                          --wait --timeout 3m
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline succeeded: ${DOCKERHUB_REPO}:${IMAGE_TAG} deployed to ${HELM_NAMESPACE}"
+        }
+        failure {
+            echo "Pipeline failed at stage: ${env.STAGE_NAME}"
+        }
+        always {
+            sh 'docker image prune -f || true'
+        }
+    }
+}
